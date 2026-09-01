@@ -163,22 +163,22 @@ def load_data():
 
 
 def save_data(df):
-
     output = df.copy()
 
     if not output.empty:
+        output["Date"] = pd.to_datetime(
+            output["Date"],
+            errors="coerce"
+        )
 
-        output["Date"] = (
-            output["Date"]
-            .dt
-            .strftime("%d-%m-%Y")
+        output["Date"] = output["Date"].dt.strftime(
+            "%d-%m-%Y"
         )
 
     output.to_csv(
         FILE,
         index=False
     )
-
 
 # =========================================================
 # TRANSACTION FUNCTIONS
