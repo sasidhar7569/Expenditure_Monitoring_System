@@ -438,6 +438,23 @@ if "username" not in st.session_state:
 
 st.markdown("""
 <style>
+/* Fix login page text visibility */
+.hero-title {
+    color: #172033 !important;
+    font-weight: 800 !important;
+}
+
+.hero-subtitle {
+    color: #52627a !important;
+}
+
+.login-title {
+    color: #ffffff !important;
+}
+
+.login-label {
+    color: #ffffff !important;
+}
 
 .main {
     background-color: #f7f8fa;
