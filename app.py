@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
+import hashlib
 import plotly.express as px
 from pathlib import Path
 from datetime import date
-import json
 
 # =========================================================
-# CONFIGURATION
+# PAGE CONFIGURATION
 # =========================================================
 
 st.set_page_config(
@@ -16,16 +17,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-FILE = Path(__file__).parent.parent / "expenses.csv"
-BUDGET_FILE = Path(__file__).parent.parent / "budget.json"
+# =========================================================
+# PATHS
+# =========================================================
 
-COLUMNS = [
-    "Date",
-    "Type",
-    "Category",
-    "Description",
-    "Amount"
-]
+BASE_DIR = Path(__file__).resolve().parent
+
+# Step 7: SQLite database
+DB_FILE = BASE_DIR / "finance.db"
+
+# Existing CSV is kept only for one-time migration/back-up
+LEGACY_CSV = BASE_DIR.parent / "expenses.csv"
 
 CATEGORIES = [
     "Food",
@@ -39,6 +41,395 @@ CATEGORIES = [
     "Other"
 ]
 
+# =========================================================
+# DATABASE
+# =========================================================
+
+def get_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database():
+    conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            transaction_date TEXT NOT NULL,
+            transaction_type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            amount REAL NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE NOT NULL,
+            monthly_budget REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def signup_user(username, password):
+    username = username.strip()
+
+    if not username or not password:
+        return False, "Please fill in all fields."
+
+    conn = get_connection()
+
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password) VALUES (?, ?)",
+            (username, hash_password(password))
+        )
+        conn.commit()
+        return True, "Account created successfully. Please login."
+
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+
+    finally:
+        conn.close()
+
+
+def login_user(username, password):
+    conn = get_connection()
+
+    user = conn.execute(
+        """
+        SELECT id, username
+        FROM users
+        WHERE username = ? AND password = ?
+        """,
+        (username.strip(), hash_password(password))
+    ).fetchone()
+
+    conn.close()
+
+    if user:
+        return dict(user)
+
+    return None
+
+
+# =========================================================
+# ONE-TIME LEGACY CSV MIGRATION
+# =========================================================
+
+def migrate_legacy_csv(user_id):
+    """
+    Import the old expenses.csv only when the SQLite database
+    has no transactions at all. This prevents new users from
+    receiving another user's legacy transactions.
+    """
+
+    conn = get_connection()
+
+    total_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM transactions"
+    ).fetchone()["count"]
+
+    if total_count > 0:
+        conn.close()
+        return
+
+    if not LEGACY_CSV.exists() or LEGACY_CSV.stat().st_size == 0:
+        conn.close()
+        return
+
+    try:
+        old_df = pd.read_csv(LEGACY_CSV)
+
+        required = [
+            "Date",
+            "Type",
+            "Category",
+            "Description",
+            "Amount"
+        ]
+
+        if not all(column in old_df.columns for column in required):
+            conn.close()
+            return
+
+        old_df["Date"] = pd.to_datetime(
+            old_df["Date"],
+            dayfirst=True,
+            errors="coerce"
+        )
+
+        old_df["Amount"] = pd.to_numeric(
+            old_df["Amount"],
+            errors="coerce"
+        )
+
+        old_df = old_df.dropna(
+            subset=["Date", "Amount"]
+        )
+
+        for _, row in old_df.iterrows():
+            transaction_type = str(row["Type"]).strip().title()
+
+            if transaction_type not in ["Income", "Expense"]:
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO transactions
+                (
+                    user_id,
+                    transaction_date,
+                    transaction_type,
+                    category,
+                    description,
+                    amount
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    row["Date"].strftime("%Y-%m-%d"),
+                    transaction_type,
+                    str(row["Category"]).strip(),
+                    str(row["Description"]).strip(),
+                    float(row["Amount"])
+                )
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+
+    finally:
+        conn.close()
+
+
+# =========================================================
+# TRANSACTION DATA
+# =========================================================
+
+def load_data(user_id):
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT
+            id AS ID,
+            transaction_date AS Date,
+            transaction_type AS Type,
+            category AS Category,
+            description AS Description,
+            amount AS Amount
+        FROM transactions
+        WHERE user_id = ?
+        ORDER BY transaction_date DESC, id DESC
+        """,
+        (user_id,)
+    ).fetchall()
+
+    conn.close()
+
+    columns = [
+        "ID",
+        "Date",
+        "Type",
+        "Category",
+        "Description",
+        "Amount"
+    ]
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame([dict(row) for row in rows])
+
+    df["Date"] = pd.to_datetime(
+        df["Date"],
+        errors="coerce"
+    )
+
+    df["Amount"] = pd.to_numeric(
+        df["Amount"],
+        errors="coerce"
+    )
+
+    return df.dropna(
+        subset=["Date", "Amount"]
+    )
+
+
+def add_transaction(
+    user_id,
+    transaction_date,
+    transaction_type,
+    category,
+    description,
+    amount
+):
+    conn = get_connection()
+
+    conn.execute(
+        """
+        INSERT INTO transactions
+        (
+            user_id,
+            transaction_date,
+            transaction_type,
+            category,
+            description,
+            amount
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            pd.Timestamp(transaction_date).strftime("%Y-%m-%d"),
+            transaction_type,
+            category,
+            description.strip(),
+            float(amount)
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def update_transaction(
+    user_id,
+    transaction_id,
+    transaction_date,
+    transaction_type,
+    category,
+    description,
+    amount
+):
+    conn = get_connection()
+
+    conn.execute(
+        """
+        UPDATE transactions
+        SET
+            transaction_date = ?,
+            transaction_type = ?,
+            category = ?,
+            description = ?,
+            amount = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            pd.Timestamp(transaction_date).strftime("%Y-%m-%d"),
+            transaction_type,
+            category,
+            description.strip(),
+            float(amount),
+            int(transaction_id),
+            user_id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def delete_transaction(user_id, transaction_id):
+    conn = get_connection()
+
+    conn.execute(
+        """
+        DELETE FROM transactions
+        WHERE id = ? AND user_id = ?
+        """,
+        (int(transaction_id), user_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# BUDGET
+# =========================================================
+
+def load_budget(user_id):
+    conn = get_connection()
+
+    row = conn.execute(
+        """
+        SELECT monthly_budget
+        FROM budgets
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return 0.0
+
+    return float(row["monthly_budget"])
+
+
+def save_budget(user_id, amount):
+    conn = get_connection()
+
+    conn.execute(
+        """
+        INSERT INTO budgets (user_id, monthly_budget)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET monthly_budget = excluded.monthly_budget
+        """,
+        (user_id, float(amount))
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# DATABASE INITIALIZATION
+# =========================================================
+
+init_database()
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+if "username" not in st.session_state:
+    st.session_state.username = ""
 
 
 # =========================================================
@@ -96,209 +487,173 @@ st.markdown("""
     margin-bottom: 10px;
 }
 
+.login-box {
+    max-width: 650px;
+    margin: 40px auto;
+    padding: 35px;
+    border-radius: 18px;
+    background: white;
+    border: 1px solid #e5e7eb;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
 
 # =========================================================
-# FILE HANDLING
+# LOGIN / SIGNUP PAGE
 # =========================================================
 
-def create_file():
+def authentication_page():
 
-    if not FILE.exists() or FILE.stat().st_size == 0:
-
-        pd.DataFrame(
-            columns=COLUMNS
-        ).to_csv(
-            FILE,
-            index=False
-        )
-
-
-def load_data():
-
-    create_file()
-
-    try:
-
-        df = pd.read_csv(FILE)
-
-    except Exception:
-
-        return pd.DataFrame(
-            columns=COLUMNS
-        )
-
-    if df.empty:
-
-        return pd.DataFrame(
-            columns=COLUMNS
-        )
-
-    for column in COLUMNS:
-
-        if column not in df.columns:
-
-            df[column] = ""
-
-    df = df[COLUMNS]
-
-    df["Date"] = pd.to_datetime(
-        df["Date"],
-        dayfirst=True,
-        errors="coerce"
+    st.markdown(
+        """
+        <div class="login-box">
+            <h1 style="text-align:center;">
+                💰 Personal Finance
+            </h1>
+            <p style="text-align:center; color:#6b7280;">
+                Securely manage your income, expenses and budget
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    df["Amount"] = pd.to_numeric(
-        df["Amount"],
-        errors="coerce"
-    )
+    col1, col2, col3 = st.columns([1, 2, 1])
 
-    df = df.dropna(
-        subset=["Date", "Amount"]
-    )
+    with col2:
 
-    return df
-
-
-def save_data(df):
-    output = df.copy()
-
-    if not output.empty:
-        output["Date"] = pd.to_datetime(
-            output["Date"],
-            errors="coerce"
+        login_tab, signup_tab = st.tabs(
+            ["🔐 Login", "📝 Create Account"]
         )
 
-        output["Date"] = output["Date"].dt.strftime(
-            "%d-%m-%Y"
-        )
+        with login_tab:
 
-    output.to_csv(
-        FILE,
-        index=False
-    )
+            st.subheader("Welcome Back")
+
+            username = st.text_input(
+                "Username",
+                key="login_username"
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="login_password"
+            )
+
+            if st.button(
+                "🔓 Login",
+                use_container_width=True
+            ):
+
+                if not username.strip() or not password:
+
+                    st.warning(
+                        "Please enter username and password."
+                    )
+
+                else:
+
+                    user = login_user(
+                        username,
+                        password
+                    )
+
+                    if user:
+
+                        st.session_state.logged_in = True
+                        st.session_state.user_id = user["id"]
+                        st.session_state.username = user["username"]
+
+                        # Import existing CSV data for the first user
+                        migrate_legacy_csv(
+                            user["id"]
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            "Invalid username or password."
+                        )
+
+        with signup_tab:
+
+            st.subheader("Create Your Account")
+
+            new_username = st.text_input(
+                "Choose Username",
+                key="signup_username"
+            )
+
+            new_password = st.text_input(
+                "Choose Password",
+                type="password",
+                key="signup_password"
+            )
+
+            confirm_password = st.text_input(
+                "Confirm Password",
+                type="password",
+                key="confirm_password"
+            )
+
+            if st.button(
+                "✨ Create Account",
+                use_container_width=True
+            ):
+
+                if (
+                    not new_username.strip()
+                    or not new_password
+                    or not confirm_password
+                ):
+
+                    st.warning(
+                        "Please fill in all fields."
+                    )
+
+                elif len(new_password) < 6:
+
+                    st.warning(
+                        "Password must contain at least 6 characters."
+                    )
+
+                elif new_password != confirm_password:
+
+                    st.error(
+                        "Passwords do not match."
+                    )
+
+                else:
+
+                    success, message = signup_user(
+                        new_username,
+                        new_password
+                    )
+
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
+
+
+if not st.session_state.logged_in:
+    authentication_page()
+    st.stop()
+
 
 # =========================================================
-# TRANSACTION FUNCTIONS
+# LOAD CURRENT USER DATA
 # =========================================================
 
-def add_transaction(
-    transaction_date,
-    transaction_type,
-    category,
-    description,
-    amount
-):
+user_id = st.session_state.user_id
+username = st.session_state.username
 
-    df = load_data()
-
-    new_transaction = pd.DataFrame({
-        "Date": [
-            pd.Timestamp(transaction_date)
-        ],
-        "Type": [
-            transaction_type
-        ],
-        "Category": [
-            category
-        ],
-        "Description": [
-            description
-        ],
-        "Amount": [
-            float(amount)
-        ]
-    })
-
-    df = pd.concat(
-        [
-            df,
-            new_transaction
-        ],
-        ignore_index=True
-    )
-
-    save_data(df)
-
-
-def delete_transaction(index):
-
-    df = load_data()
-
-    if 0 <= index < len(df):
-
-        df = df.drop(
-            index=index
-        )
-
-        df = df.reset_index(
-            drop=True
-        )
-
-        save_data(df)
-def update_transaction(
-    index,
-    transaction_date,
-    transaction_type,
-    category,
-    description,
-    amount
-):
-
-    df = load_data()
-
-    if 0 <= index < len(df):
-
-        df.loc[index, "Date"] = pd.Timestamp(
-            transaction_date
-        )
-
-        df.loc[index, "Type"] = transaction_type
-
-        df.loc[index, "Category"] = category
-
-        df.loc[index, "Description"] = description
-
-        df.loc[index, "Amount"] = float(amount)
-
-        save_data(df)
-def load_budget():
-
-    if not BUDGET_FILE.exists():
-        return 0.0
-
-    try:
-
-        with open(BUDGET_FILE, "r") as file:
-            data = json.load(file)
-
-        return float(
-            data.get("monthly_budget", 0)
-        )
-
-    except Exception:
-
-        return 0.0
-
-
-def save_budget(amount):
-
-    with open(BUDGET_FILE, "w") as file:
-
-        json.dump(
-            {
-                "monthly_budget": float(amount)
-            },
-            file
-        )
-
-# =========================================================
-# LOAD DATA
-# =========================================================
-
-df = load_data()
+df = load_data(user_id)
 
 
 # =========================================================
@@ -317,6 +672,23 @@ with st.sidebar:
 
     st.divider()
 
+    st.success(
+        f"👤 {username}"
+    )
+
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True
+    ):
+
+        st.session_state.logged_in = False
+        st.session_state.user_id = None
+        st.session_state.username = ""
+
+        st.rerun()
+
+    st.divider()
+
     page = st.radio(
         "Navigation",
         [
@@ -330,37 +702,7 @@ with st.sidebar:
 
     st.markdown(
         "### 🔎 Filters"
-        
     )
-    st.divider()
-
-    st.markdown(
-        "### 💰 Monthly Budget"
-    )
-
-    current_budget = load_budget()
-
-    new_budget = st.number_input(
-        "Set Monthly Budget (₹)",
-        min_value=0.0,
-        value=float(current_budget),
-        step=500.0,
-        format="%.2f"
-    )
-
-    if st.button(
-        "💾 Save Budget",
-        use_container_width=True
-    ):
-
-        save_budget(new_budget)
-
-        st.success(
-            "Budget saved successfully!"
-        )
-
-        st.rerun()
-    
 
     if not df.empty:
 
@@ -369,10 +711,7 @@ with st.sidebar:
 
         date_range = st.date_input(
             "Date range",
-            value=(
-                min_date,
-                max_date
-            ),
+            value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date
         )
@@ -387,13 +726,11 @@ with st.sidebar:
 
             filtered_df = df[
                 (
-                    df["Date"].dt.date
-                    >= start_date
+                    df["Date"].dt.date >= start_date
                 )
                 &
                 (
-                    df["Date"].dt.date
-                    <= end_date
+                    df["Date"].dt.date <= end_date
                 )
             ].copy()
 
@@ -405,34 +742,66 @@ with st.sidebar:
 
         filtered_df = df.copy()
 
+    st.divider()
+
+    st.markdown(
+        "### 💰 Monthly Budget"
+    )
+
+    current_budget = load_budget(user_id)
+
+    new_budget = st.number_input(
+        "Set Monthly Budget (₹)",
+        min_value=0.0,
+        value=float(current_budget),
+        step=500.0,
+        format="%.2f"
+    )
+
+    if st.button(
+        "💾 Save Budget",
+        use_container_width=True
+    ):
+
+        save_budget(
+            user_id,
+            new_budget
+        )
+
+        st.success(
+            "Budget saved successfully!"
+        )
+
+        st.rerun()
+
 
 # =========================================================
 # FINANCIAL CALCULATIONS
 # =========================================================
 
-income = filtered_df.loc[
-    filtered_df["Type"].str.lower()
-    == "income",
-    "Amount"
-].sum()
+if filtered_df.empty:
 
-expense = filtered_df.loc[
-    filtered_df["Type"].str.lower()
-    == "expense",
-    "Amount"
-].sum()
+    income = 0.0
+    expense = 0.0
+
+else:
+
+    income = filtered_df.loc[
+        filtered_df["Type"].str.lower() == "income",
+        "Amount"
+    ].sum()
+
+    expense = filtered_df.loc[
+        filtered_df["Type"].str.lower() == "expense",
+        "Amount"
+    ].sum()
 
 balance = income - expense
 
 if income > 0:
-
-    savings_rate = (
-        balance / income
-    ) * 100
-
+    savings_rate = (balance / income) * 100
 else:
-
-    savings_rate = 0
+    savings_rate = 0.0
 
 
 # =========================================================
@@ -450,11 +819,10 @@ if page == "🏠 Dashboard":
 
     st.markdown(
         '<div class="dashboard-subtitle">'
-        'Track your income, spending and savings in one place.'
+        f'Welcome back, {username}. Track your income, spending and savings in one place.'
         '</div>',
         unsafe_allow_html=True
     )
-
 
     # -----------------------------------------------------
     # METRIC CARDS
@@ -463,71 +831,52 @@ if page == "🏠 Dashboard":
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-
         st.markdown(
             f"""
             <div class="metric-card">
-                <div class="metric-title">
-                    💰 Total Income
-                </div>
-                <div class="metric-value">
-                    ₹{income:,.2f}
-                </div>
+                <div class="metric-title">💰 Total Income</div>
+                <div class="metric-value">₹{income:,.2f}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
     with col2:
-
         st.markdown(
             f"""
             <div class="metric-card">
-                <div class="metric-title">
-                    💸 Total Expenses
-                </div>
-                <div class="metric-value">
-                    ₹{expense:,.2f}
-                </div>
+                <div class="metric-title">💸 Total Expenses</div>
+                <div class="metric-value">₹{expense:,.2f}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
     with col3:
-
         st.markdown(
             f"""
             <div class="metric-card">
-                <div class="metric-title">
-                    🏦 Balance
-                </div>
-                <div class="metric-value">
-                    ₹{balance:,.2f}
-                </div>
+                <div class="metric-title">🏦 Balance</div>
+                <div class="metric-value">₹{balance:,.2f}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
     with col4:
-
         st.markdown(
             f"""
             <div class="metric-card">
-                <div class="metric-title">
-                    📊 Savings Rate
-                </div>
-                <div class="metric-value">
-                    {savings_rate:.1f}%
-                </div>
+                <div class="metric-title">📊 Savings Rate</div>
+                <div class="metric-value">{savings_rate:.1f}%</div>
             </div>
             """,
             unsafe_allow_html=True
         )
-    # =====================================================
+
+    # -----------------------------------------------------
     # MONTHLY BUDGET
-    # =====================================================
+    # -----------------------------------------------------
 
     st.divider()
 
@@ -538,7 +887,7 @@ if page == "🏠 Dashboard":
         unsafe_allow_html=True
     )
 
-    monthly_budget = load_budget()
+    monthly_budget = load_budget(user_id)
 
     if monthly_budget > 0:
 
@@ -551,21 +900,18 @@ if page == "🏠 Dashboard":
         col1, col2, col3 = st.columns(3)
 
         with col1:
-
             st.metric(
                 "Monthly Budget",
                 f"₹{monthly_budget:,.2f}"
             )
 
         with col2:
-
             st.metric(
                 "Spent",
                 f"₹{expense:,.2f}"
             )
 
         with col3:
-
             st.metric(
                 "Remaining",
                 f"₹{budget_remaining:,.2f}"
@@ -583,19 +929,14 @@ if page == "🏠 Dashboard":
         )
 
         if budget_used >= 100:
-
             st.error(
                 "🔴 You have exceeded your monthly budget!"
             )
-
         elif budget_used >= 80:
-
             st.warning(
                 "🟡 You have used more than 80% of your monthly budget."
             )
-
         else:
-
             st.success(
                 "🟢 You are within your monthly budget."
             )
@@ -606,27 +947,19 @@ if page == "🏠 Dashboard":
             "Set a monthly budget from the sidebar."
         )
 
-    st.divider()
-
-
     # -----------------------------------------------------
     # CHARTS
     # -----------------------------------------------------
 
-    expense_df = filtered_df[
-        filtered_df["Type"].str.lower()
-        == "expense"
-    ].copy()
+    st.divider()
 
+    expense_df = filtered_df[
+        filtered_df["Type"].str.lower() == "expense"
+    ].copy()
 
     if not expense_df.empty:
 
         col1, col2 = st.columns(2)
-
-
-        # -------------------------------------------------
-        # CATEGORY CHART
-        # -------------------------------------------------
 
         with col1:
 
@@ -639,8 +972,7 @@ if page == "🏠 Dashboard":
 
             category_data = (
                 expense_df
-                .groupby("Category")
-                ["Amount"]
+                .groupby("Category")["Amount"]
                 .sum()
                 .reset_index()
             )
@@ -666,11 +998,6 @@ if page == "🏠 Dashboard":
                 use_container_width=True
             )
 
-
-        # -------------------------------------------------
-        # INCOME VS EXPENSE
-        # -------------------------------------------------
-
         with col2:
 
             st.markdown(
@@ -681,14 +1008,8 @@ if page == "🏠 Dashboard":
             )
 
             comparison = pd.DataFrame({
-                "Type": [
-                    "Income",
-                    "Expense"
-                ],
-                "Amount": [
-                    income,
-                    expense
-                ]
+                "Type": ["Income", "Expense"],
+                "Amount": [income, expense]
             })
 
             fig_bar = px.bar(
@@ -719,11 +1040,6 @@ if page == "🏠 Dashboard":
                 use_container_width=True
             )
 
-
-        # -------------------------------------------------
-        # MONTHLY TREND
-        # -------------------------------------------------
-
         st.markdown(
             '<div class="section-title">'
             '📈 Monthly Spending'
@@ -733,15 +1049,13 @@ if page == "🏠 Dashboard":
 
         expense_df["Month"] = (
             expense_df["Date"]
-            .dt
-            .to_period("M")
+            .dt.to_period("M")
             .astype(str)
         )
 
         monthly = (
             expense_df
-            .groupby("Month")
-            ["Amount"]
+            .groupby("Month")["Amount"]
             .sum()
             .reset_index()
         )
@@ -769,7 +1083,6 @@ if page == "🏠 Dashboard":
             "No expense data available yet."
         )
 
-
     # -----------------------------------------------------
     # RECENT TRANSACTIONS
     # -----------------------------------------------------
@@ -795,16 +1108,11 @@ if page == "🏠 Dashboard":
 
         recent["Date"] = (
             recent["Date"]
-            .dt
-            .strftime("%d-%m-%Y")
+            .dt.strftime("%d-%m-%Y")
         )
 
-        recent["Amount"] = (
-            recent["Amount"]
-            .map(
-                lambda x:
-                f"₹{x:,.2f}"
-            )
+        recent["Amount"] = recent["Amount"].map(
+            lambda x: f"₹{x:,.2f}"
         )
 
         st.dataframe(
@@ -834,17 +1142,23 @@ if page == "🏠 Dashboard":
 
 elif page == "💳 Transactions":
 
-    st.title("💳 Transactions")
-
-    st.caption(
-        "Manage your income and expenses in one place."
+    st.markdown(
+        '<div class="dashboard-title">'
+        '💳 Transactions'
+        '</div>',
+        unsafe_allow_html=True
     )
 
-    st.divider()
+    st.markdown(
+        '<div class="dashboard-subtitle">'
+        'Manage your income and expenses in one place.'
+        '</div>',
+        unsafe_allow_html=True
+    )
 
-    # =====================================================
+    # -----------------------------------------------------
     # ADD TRANSACTION
-    # =====================================================
+    # -----------------------------------------------------
 
     st.subheader("✨ Add New Transaction")
 
@@ -859,10 +1173,7 @@ elif page == "💳 Transactions":
 
         transaction_type = st.radio(
             "Transaction Type",
-            [
-                "💸 Expense",
-                "💰 Income"
-            ],
+            ["💸 Expense", "💰 Income"],
             horizontal=True
         )
 
@@ -921,6 +1232,7 @@ elif page == "💳 Transactions":
             else:
 
                 add_transaction(
+                    user_id,
                     transaction_date,
                     transaction_type,
                     category,
@@ -936,9 +1248,9 @@ elif page == "💳 Transactions":
 
     st.divider()
 
-    # =====================================================
+    # -----------------------------------------------------
     # FIND TRANSACTIONS
-    # =====================================================
+    # -----------------------------------------------------
 
     st.subheader("🔎 Find Transactions")
 
@@ -946,7 +1258,7 @@ elif page == "💳 Transactions":
         "Search and filter your financial records."
     )
 
-    current_df = load_data()
+    current_df = load_data(user_id)
 
     if not current_df.empty:
 
@@ -963,11 +1275,7 @@ elif page == "💳 Transactions":
 
             type_filter = st.selectbox(
                 "💳 Type",
-                [
-                    "All",
-                    "Expense",
-                    "Income"
-                ]
+                ["All", "Expense", "Income"]
             )
 
         with col3:
@@ -975,8 +1283,7 @@ elif page == "💳 Transactions":
             category_filter = st.selectbox(
                 "🏷️ Category",
                 ["All"]
-                +
-                sorted(
+                + sorted(
                     current_df["Category"]
                     .dropna()
                     .unique()
@@ -986,14 +1293,13 @@ elif page == "💳 Transactions":
 
         filtered_transactions = current_df.copy()
 
-        # Search
-
         if search_text.strip():
 
             search = search_text.lower()
 
             description_match = (
                 filtered_transactions["Description"]
+                .astype(str)
                 .str.lower()
                 .str.contains(
                     search,
@@ -1003,6 +1309,7 @@ elif page == "💳 Transactions":
 
             category_match = (
                 filtered_transactions["Category"]
+                .astype(str)
                 .str.lower()
                 .str.contains(
                     search,
@@ -1012,24 +1319,17 @@ elif page == "💳 Transactions":
 
             filtered_transactions = (
                 filtered_transactions[
-                    description_match
-                    |
-                    category_match
+                    description_match | category_match
                 ]
             )
-
-        # Type filter
 
         if type_filter != "All":
 
             filtered_transactions = (
                 filtered_transactions[
-                    filtered_transactions["Type"]
-                    == type_filter
+                    filtered_transactions["Type"] == type_filter
                 ]
             )
-
-        # Category filter
 
         if category_filter != "All":
 
@@ -1044,30 +1344,24 @@ elif page == "💳 Transactions":
             f"Showing {len(filtered_transactions)} transaction(s)"
         )
 
-        # =================================================
+        # -------------------------------------------------
         # TRANSACTION TABLE
-        # =================================================
+        # -------------------------------------------------
 
         st.subheader("🧾 Your Transactions")
 
         if not filtered_transactions.empty:
 
-            display_df = (
-                filtered_transactions.copy()
-            )
+            display_df = filtered_transactions.copy()
 
             display_df["Date"] = (
                 display_df["Date"]
-                .dt
-                .strftime("%d-%m-%Y")
+                .dt.strftime("%d-%m-%Y")
             )
 
             display_df["Amount"] = (
                 display_df["Amount"]
-                .map(
-                    lambda x:
-                    f"₹{x:,.2f}"
-                )
+                .map(lambda x: f"₹{x:,.2f}")
             )
 
             st.dataframe(
@@ -1092,9 +1386,9 @@ elif page == "💳 Transactions":
 
         st.divider()
 
-        # =================================================
+        # -------------------------------------------------
         # EDIT TRANSACTION
-        # =================================================
+        # -------------------------------------------------
 
         st.subheader("✏️ Edit Transaction")
 
@@ -1102,9 +1396,7 @@ elif page == "💳 Transactions":
 
             edit_options = []
 
-            for index, row in (
-                filtered_transactions.iterrows()
-            ):
+            for _, row in filtered_transactions.iterrows():
 
                 label = (
                     f"{row['Date'].strftime('%d-%m-%Y')} | "
@@ -1115,7 +1407,7 @@ elif page == "💳 Transactions":
                 )
 
                 edit_options.append(
-                    (index, label)
+                    (int(row["ID"]), label)
                 )
 
             selected_edit = st.selectbox(
@@ -1125,11 +1417,11 @@ elif page == "💳 Transactions":
                 key="edit_transaction"
             )
 
-            edit_index = selected_edit[0]
+            edit_id = selected_edit[0]
 
-            edit_row = current_df.loc[
-                edit_index
-            ]
+            edit_row = current_df[
+                current_df["ID"] == edit_id
+            ].iloc[0]
 
             col1, col2 = st.columns(2)
 
@@ -1143,10 +1435,7 @@ elif page == "💳 Transactions":
 
                 edit_type = st.selectbox(
                     "💳 Type",
-                    [
-                        "Expense",
-                        "Income"
-                    ],
+                    ["Expense", "Income"],
                     index=(
                         0
                         if edit_row["Type"] == "Expense"
@@ -1156,13 +1445,10 @@ elif page == "💳 Transactions":
                 )
 
                 if edit_row["Category"] in CATEGORIES:
-
                     category_index = CATEGORIES.index(
                         edit_row["Category"]
                     )
-
                 else:
-
                     category_index = 0
 
                 edit_category = st.selectbox(
@@ -1176,16 +1462,14 @@ elif page == "💳 Transactions":
 
                 edit_description = st.text_input(
                     "📝 Description",
-                    value=edit_row["Description"],
+                    value=str(edit_row["Description"]),
                     key="edit_description"
                 )
 
                 edit_amount = st.number_input(
                     "💵 Amount (₹)",
                     min_value=0.0,
-                    value=float(
-                        edit_row["Amount"]
-                    ),
+                    value=float(edit_row["Amount"]),
                     step=50.0,
                     key="edit_amount"
                 )
@@ -1210,7 +1494,8 @@ elif page == "💳 Transactions":
                 else:
 
                     update_transaction(
-                        edit_index,
+                        user_id,
+                        edit_id,
                         edit_date,
                         edit_type,
                         edit_category,
@@ -1226,9 +1511,9 @@ elif page == "💳 Transactions":
 
         st.divider()
 
-        # =================================================
+        # -------------------------------------------------
         # DELETE TRANSACTION
-        # =================================================
+        # -------------------------------------------------
 
         st.subheader("🗑️ Delete Transaction")
 
@@ -1236,9 +1521,7 @@ elif page == "💳 Transactions":
 
             delete_options = []
 
-            for index, row in (
-                filtered_transactions.iterrows()
-            ):
+            for _, row in filtered_transactions.iterrows():
 
                 label = (
                     f"{row['Date'].strftime('%d-%m-%Y')} | "
@@ -1248,7 +1531,7 @@ elif page == "💳 Transactions":
                 )
 
                 delete_options.append(
-                    (index, label)
+                    (int(row["ID"]), label)
                 )
 
             selected_delete = st.selectbox(
@@ -1258,7 +1541,7 @@ elif page == "💳 Transactions":
                 key="delete_transaction"
             )
 
-            delete_index = selected_delete[0]
+            delete_id = selected_delete[0]
 
             if st.button(
                 "🗑️ Delete Selected Transaction",
@@ -1266,7 +1549,8 @@ elif page == "💳 Transactions":
             ):
 
                 delete_transaction(
-                    delete_index
+                    user_id,
+                    delete_id
                 )
 
                 st.success(
@@ -1280,6 +1564,7 @@ elif page == "💳 Transactions":
         st.info(
             "No transactions available. Add your first transaction above."
         )
+
 
 # =========================================================
 # ANALYTICS PAGE
@@ -1301,27 +1586,17 @@ elif page == "📊 Analytics":
         unsafe_allow_html=True
     )
 
-
     expense_df = filtered_df[
-        filtered_df["Type"].str.lower()
-        == "expense"
+        filtered_df["Type"].str.lower() == "expense"
     ].copy()
-
 
     if not expense_df.empty:
 
-        # -----------------------------------------------
-        # CATEGORY SUMMARY
-        # -----------------------------------------------
-
-        st.subheader(
-            "Category-wise Spending"
-        )
+        st.subheader("Category-wise Spending")
 
         category_summary = (
             expense_df
-            .groupby("Category")
-            ["Amount"]
+            .groupby("Category")["Amount"]
             .sum()
             .reset_index()
             .sort_values(
@@ -1347,15 +1622,7 @@ elif page == "📊 Analytics":
             use_container_width=True
         )
 
-
-        # -----------------------------------------------
-        # TOP CATEGORY
-        # -----------------------------------------------
-
-        top_category = (
-            category_summary
-            .iloc[0]
-        )
+        top_category = category_summary.iloc[0]
 
         st.info(
             f"Your highest spending category is "
@@ -1364,11 +1631,6 @@ elif page == "📊 Analytics":
             f"**₹{top_category['Amount']:,.2f}**."
         )
 
-
-        # -----------------------------------------------
-        # AVERAGE DAILY SPENDING
-        # -----------------------------------------------
-
         days = (
             expense_df["Date"]
             .dt.date
@@ -1376,16 +1638,12 @@ elif page == "📊 Analytics":
         )
 
         if days > 0:
-
             average_daily = (
                 expense_df["Amount"].sum()
                 / days
             )
-
         else:
-
             average_daily = 0
-
 
         col1, col2 = st.columns(2)
 
