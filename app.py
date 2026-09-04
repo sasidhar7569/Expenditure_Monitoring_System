@@ -12,7 +12,7 @@ from datetime import date
 
 st.set_page_config(
     page_title="Personal Finance Dashboard",
-    page_icon="💰",
+    page_icon="WELCOME",
     layout="wide",
     initial_sidebar_state="expanded"
 )
