@@ -512,6 +512,14 @@ st.markdown("""
     background: white;
     border: 1px solid #e5e7eb;
 }
+.login-box h1 {
+    color: #111827 !important;
+    font-weight: 800 !important;
+}
+
+.login-box p {
+    color: #52627a !important;
+}
 
 </style>
 """, unsafe_allow_html=True)
